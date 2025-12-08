@@ -1,0 +1,11 @@
+# Binaries
+rollback-url-tagging
+
+# Build caches
+.gocache/
+
+# Editor / OS junk
+.DS_Store
+
+# Environment overrides
+.env
