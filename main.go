@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
@@ -47,6 +48,11 @@ var (
 
 var bulkS3Prefix string
 
+var (
+	errorLogFile    *os.File
+	errorLogEncoder *json.Encoder
+)
+
 // ------------------------------
 // Init
 // ------------------------------
@@ -72,6 +78,19 @@ func init() {
 		// safe default for local/dev usage; override via env in real envs
 		bulkS3Prefix = "https://dev-genesis.s3.ap-southeast-1.amazonaws.com/"
 	}
+
+	// Error log file (JSON lines). Optional; falls back to stdout-only if it fails.
+	errorLogPath := os.Getenv("ERROR_LOG_PATH")
+	if errorLogPath == "" {
+		errorLogPath = "errors.log.jsonl"
+	}
+	f, err := os.OpenFile(errorLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		log.Printf("[WARN] failed to open error log file %q: %v", errorLogPath, err)
+	} else {
+		errorLogFile = f
+		errorLogEncoder = json.NewEncoder(f)
+	}
 }
 
 // ------------------------------
@@ -94,6 +113,10 @@ func main() {
 		log.Fatalf("open db: %v", err)
 	}
 	defer db.Close()
+
+	if errorLogFile != nil {
+		defer errorLogFile.Close()
+	}
 
 	if err := db.Ping(); err != nil {
 		log.Fatalf("ping db: %v", err)
@@ -134,6 +157,10 @@ func migrateBulkRemoveTag(ctx context.Context, db *sqlx.DB, dryRun bool, batchSi
 	for {
 		rows, err := fetchBulkBatch(ctx, db, lastID, batchSize)
 		if err != nil {
+			logErrorJSON("bulk_fetch_batch", map[string]interface{}{
+				"last_id":    lastID,
+				"batch_size": batchSize,
+			}, err)
 			return fmt.Errorf("fetch bulk batch: %w", err)
 		}
 		if len(rows) == 0 {
@@ -152,6 +179,10 @@ func migrateBulkRemoveTag(ctx context.Context, db *sqlx.DB, dryRun bool, batchSi
 			updated, skipped, err := processBulkRowRemoveTag(ctx, db, r, dryRun)
 			if err != nil {
 				log.Printf("[BULK][ERROR] id=%d: %v", r.ID, err)
+				logErrorJSON("bulk_process_row", map[string]interface{}{
+					"id":      r.ID,
+					"dry_run": dryRun,
+				}, err)
 				continue
 			}
 			if updated {
@@ -277,6 +308,10 @@ func migratePartnerRemoveTag(ctx context.Context, db *sqlx.DB, dryRun bool, batc
 	for {
 		rows, err := fetchPartnerBatch(ctx, db, lastID, batchSize)
 		if err != nil {
+			logErrorJSON("partner_fetch_batch", map[string]interface{}{
+				"last_partner_id": lastID,
+				"batch_size":      batchSize,
+			}, err)
 			return fmt.Errorf("fetch partner batch: %w", err)
 		}
 		if len(rows) == 0 {
@@ -295,6 +330,10 @@ func migratePartnerRemoveTag(ctx context.Context, db *sqlx.DB, dryRun bool, batc
 			updated, skipped, err := processPartnerRowRemoveTag(ctx, db, r, dryRun)
 			if err != nil {
 				log.Printf("[PARTNER][ERROR] partner_id=%d: %v", r.PartnerID, err)
+				logErrorJSON("partner_process_row", map[string]interface{}{
+					"partner_id": r.PartnerID,
+					"dry_run":    dryRun,
+				}, err)
 				continue
 			}
 			if updated {
@@ -434,6 +473,11 @@ func migrateClientRemoveTag(ctx context.Context, db *sqlx.DB, dryRun bool, batch
 	for {
 		rows, err := fetchClientBatch(ctx, db, lastID, batchSize, like)
 		if err != nil {
+			logErrorJSON("client_fetch_batch", map[string]interface{}{
+				"last_client_id": lastID,
+				"batch_size":     batchSize,
+				"like_prefix":    like,
+			}, err)
 			return fmt.Errorf("fetch client batch: %w", err)
 		}
 		if len(rows) == 0 {
@@ -452,6 +496,10 @@ func migrateClientRemoveTag(ctx context.Context, db *sqlx.DB, dryRun bool, batch
 			updated, skipped, err := processClientRowRemoveTag(ctx, db, r, dryRun)
 			if err != nil {
 				log.Printf("[CLIENT][ERROR] client_id=%d: %v", r.ClientID, err)
+				logErrorJSON("client_process_row", map[string]interface{}{
+					"client_id": r.ClientID,
+					"dry_run":   dryRun,
+				}, err)
 				continue
 			}
 			if updated {
@@ -594,6 +642,26 @@ func removeTagParamsFromURL(rawURL string) (string, bool) {
 
 	u.RawQuery = q.Encode()
 	return u.String(), true
+}
+
+// ------------------------------
+// Error logging helper
+// ------------------------------
+
+// logErrorJSON writes a single JSON line describing an error to the error log file, if configured.
+// It is best-effort and never panics or returns errors.
+func logErrorJSON(kind string, meta map[string]interface{}, err error) {
+	if errorLogEncoder == nil || err == nil {
+		return
+	}
+
+	entry := map[string]interface{}{
+		"kind":      kind,
+		"error":     err.Error(),
+		"meta":      meta,
+		"timestamp": time.Now().Format(time.RFC3339Nano),
+	}
+	_ = errorLogEncoder.Encode(entry)
 }
 
 // ------------------------------
