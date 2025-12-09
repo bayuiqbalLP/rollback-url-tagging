@@ -45,6 +45,8 @@ var (
 	hydraSignPrefix string
 )
 
+var bulkS3Prefix string
+
 // ------------------------------
 // Init
 // ------------------------------
@@ -54,10 +56,21 @@ func init() {
 		log.Fatalf("failed to load .env: %v", err)
 	}
 
+	// Hydra sign prefix (for client attachments)
 	hydraSignPrefix = os.Getenv("HYDRA_SIGN_PREFIX")
 	if hydraSignPrefix == "" {
 		// default for safety
 		hydraSignPrefix = "https://api.dev-genesis.lionparcel.com/hydra/v1/asset/sign?"
+	}
+
+	// Bulk S3 prefix (for bulk.archive_file)
+	// Example:
+	// - dev: https://dev-genesis.s3.ap-southeast-1.amazonaws.com/
+	// - prod: https://genesis.s3.ap-southeast-1.amazonaws.com/
+	bulkS3Prefix = os.Getenv("BULK_S3_PREFIX")
+	if bulkS3Prefix == "" {
+		// safe default for local/dev usage; override via env in real envs
+		bulkS3Prefix = "https://dev-genesis.s3.ap-southeast-1.amazonaws.com/"
 	}
 }
 
@@ -189,11 +202,13 @@ func processBulkRowRemoveTag(
 	if raw == "" {
 		return false, true, nil
 	}
-
 	newURL, changed := removeTagParamsFromURL(raw)
 	if !changed {
 		return false, true, nil
 	}
+
+	// Normalize to use env-based S3 prefix for bulk files
+	newURL = normalizeBulkArchiveURL(newURL)
 
 	if dryRun {
 		log.Printf("[BULK][DRY-RUN] id=%d archive_file\nold=%s\nnew=%s", row.ID, raw, newURL)
@@ -216,6 +231,32 @@ WHERE id = ?
 `
 	_, err := db.ExecContext(ctx, query, newURL, id)
 	return err
+}
+
+// normalizeBulkArchiveURL rebuilds the bulk archive URL using the BULK_S3_PREFIX env,
+// keeping only the filename part. If parsing fails, it returns the input as-is.
+func normalizeBulkArchiveURL(rawURL string) string {
+	if bulkS3Prefix == "" || rawURL == "" {
+		return rawURL
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+
+	// Take only the last segment (file name), e.g. bulk_upload_client_rate_1754324774.xlsx
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) == 0 {
+		return rawURL
+	}
+	filename := parts[len(parts)-1]
+	if filename == "" {
+		return rawURL
+	}
+
+	prefix := strings.TrimRight(bulkS3Prefix, "/")
+	return prefix + "/" + filename
 }
 
 // ------------------------------
